@@ -11,6 +11,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <!-- Google API (Calendar) -->
+<!-- Google Identity Services (nueva API OAuth2) -->
+<script src="https://accounts.google.com/gsi/client"></script>
+<!-- Google API client (para Calendar) -->
 <script src="https://apis.google.com/js/api.js"></script>
 <!-- Supabase JS (100% gratuito, sin tarjeta) -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -1528,8 +1531,10 @@ var DEMO = (_sbUrlFinal === 'REEMPLAZAR_SUPABASE_URL');
    ════════════════════════════════════════════ */
 var GCAL_CLIENT_ID = 'REEMPLAZAR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
 var GCAL_SCOPES    = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly';
-var gcalReady      = false;   // true cuando gapi está cargado
-var gcalSigned     = false;   // true cuando el usuario autorizó
+var gcalReady  = false;  // true cuando gapi.client calendar está listo
+var gcalSigned = false;  // true cuando el usuario autorizó
+var gcalTokenClient = null;  // GIS token client
+var gcalAccessToken = null;  // token de acceso actual
 
 
 /* ── ESTADO ── */
@@ -2269,26 +2274,68 @@ function overlayClick(e,id){ if(e.target===e.currentTarget)cerrarModal(id); }
    GOOGLE CALENDAR
    ════════════════════════════════════════════ */
 function gcalInit(){
-  if(GCAL_CLIENT_ID.indexOf('REEMPLAZAR')>=0)return;
-  gapi.load('client:auth2',function(){
-    gapi.client.init({
-      clientId:GCAL_CLIENT_ID,scope:GCAL_SCOPES,
-      discoveryDocs:['https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest']
+  var sv=localStorage.getItem('as_gcal_client_id');if(sv&&sv.length>10)GCAL_CLIENT_ID=sv;
+  if(GCAL_CLIENT_ID.indexOf('REEMPLAZAR')>=0){gcalUpdateUI();return;}
+  // Cargar gapi.client con la API de Calendar
+  gapi.load('client',function(){
+    gapi.client.init({}).then(function(){
+      return gapi.client.load('https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest');
     }).then(function(){
       gcalReady=true;
-      var auth=gapi.auth2.getAuthInstance();
-      gcalSigned=auth.isSignedIn.get();
+      // Inicializar GIS token client
+      gcalTokenClient=google.accounts.oauth2.initTokenClient({
+        client_id:GCAL_CLIENT_ID,
+        scope:GCAL_SCOPES,
+        callback:function(resp){
+          if(resp.error){
+            console.warn('GCal token error:',resp);
+            toast('Error al conectar con Google Calendar');
+            return;
+          }
+          gcalAccessToken=resp.access_token;
+          gcalSigned=true;
+          // Guardar token
+          var expAt=Date.now()+(resp.expires_in||3600)*1000;
+          localStorage.setItem('as_gcal_token',JSON.stringify({access_token:resp.access_token,expires_at:expAt}));
+          gapi.client.setToken({access_token:resp.access_token});
+          gcalUpdateUI();
+          cargarEventosGcal();
+          toast('Google Calendar conectado');
+        }
+      });
+      // Verificar si ya hay token guardado
+      var savedToken=localStorage.getItem('as_gcal_token');
+      if(savedToken){
+        try{
+          var t=JSON.parse(savedToken);
+          if(t.access_token&&t.expires_at&&Date.now()<t.expires_at){
+            gapi.client.setToken(t);
+            gcalAccessToken=t.access_token;
+            gcalSigned=true;
+          }
+        }catch(e){}
+      }
       gcalUpdateUI();
-      auth.isSignedIn.listen(function(s){gcalSigned=s;gcalUpdateUI();if(s)cargarEventosGcal();});
     }).catch(function(e){console.warn('GCal init:',e);});
   });
 }
 function gcalToggle(){
-  if(!gcalReady){toast('⚠️ Google API no disponible');return;}
-  var auth=gapi.auth2.getAuthInstance();
-  if(gcalSigned) auth.signOut().then(function(){toast('📅 Google Calendar desconectado');});
-  else auth.signIn().then(function(){toast('✅ Google Calendar conectado');}).catch(function(){toast('⚠️ No se pudo conectar');});
+  if(!gcalReady){toast('Google API no disponible');return;}
+  if(gcalSigned){
+    // Desconectar: revocar token
+    google.accounts.oauth2.revoke(gcalAccessToken,function(){});
+    gapi.client.setToken(null);
+    gcalAccessToken=null;
+    gcalSigned=false;
+    localStorage.removeItem('as_gcal_token');
+    gcalUpdateUI();
+    toast('Google Calendar desconectado');
+  } else {
+    // Conectar: pedir token
+    gcalTokenClient.requestAccessToken({prompt:'consent'});
+  }
 }
+
 function gcalUpdateUI(){
   var btn=document.getElementById('gcal-btn');
   var sub=document.getElementById('gcal-sub-txt');
@@ -2296,19 +2343,22 @@ function gcalUpdateUI(){
   if(!btn)return;
   if(GCAL_CLIENT_ID.indexOf('REEMPLAZAR')>=0){
     btn.textContent='No configurado';btn.style.background='#ccc';btn.disabled=true;
-    if(sub)sub.textContent='Configurá tu Google Client ID en el código para activar esta función.';
+    if(sub)sub.textContent='Configurá tu Client ID en el botón de Calendar.';
     return;
   }
   if(gcalSigned){
-    var user=gapi.auth2.getAuthInstance().currentUser.get().getBasicProfile();
     btn.textContent='Desconectar';btn.className='gcal-btn desconectar';
-    if(sub)sub.textContent='✅ Conectado: '+(user?user.getEmail():'');
+    if(sub)sub.textContent='Conectado a Google Calendar';
     if(wrap)wrap.style.display='block';
   } else {
     btn.textContent='Conectar';btn.className='gcal-btn conectar';
     if(sub)sub.textContent='Al guardar un trabajo se crea el evento con aviso 1 día antes.';
     if(wrap)wrap.style.display='none';
   }
+  calUpdateGcalRow();
+  var _fab=document.getElementById('gcal-fab');
+  if(_fab){_fab.textContent=gcalSigned?'OK':'Cal';if(gcalSigned)_fab.classList.add('conectado');else _fab.classList.remove('conectado');}
+  if(document.getElementById('gcal-quick-modal')&&document.getElementById('gcal-quick-modal').classList.contains('open'))gcalQuickRefresh();
 }
 function gcalCrearEvento(trabajo){
   if(!gcalReady||!gcalSigned)return;
@@ -4114,7 +4164,7 @@ function gcalQuickRefresh(){
     if(inp&&saved&&saved.indexOf('REEMPLAZAR')<0)inp.value=saved;
   } else if(gcalSigned){
     var email='';
-    try{email=gapi.auth2.getAuthInstance().currentUser.get().getBasicProfile().getEmail();}catch(e){}
+    try{var tok=gapi.client.getToken();email=tok?'Conectado':'';}catch(e){}
     if(statusDiv)statusDiv.innerHTML='<div class="gcal-status-pill ok">Conectado'+(email?' &mdash; '+esc(email):'')+'</div>';
     if(setupDiv)setupDiv.style.display='none';
     if(actDiv)actDiv.style.display='block';
